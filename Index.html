@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <title>Visitas Discapacidad 2026</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        body { -webkit-tap-highlight-color: transparent; }
+        .tap:active { transform: scale(0.98); transition: transform 0.1s; }
+    </style>
+</head>
+<body class="bg-slate-50">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CONFIGURACIÓN — pega aquí la URL de tu deployment de Google Apps Script
+//  (Apps Script → Implementar → Administrar implementaciones → URL del web app)
+// ════════════════════════════════════════════════════════════════════════════
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbzr5my0TskBwRjmiSqMtbU-khSHabLVKjCPUgcMm-XfQ2tr82Ls3yfZx1BO_NLJh2Ed/exec';
+
+// ── Constantes UI ─────────────────────────────────────────────────────────────
+const ESTADOS = [
+    { id: 'Visitado',  icon: '✓', active: 'bg-emerald-500 text-white', card: 'border-emerald-200 bg-emerald-50/40', badge: 'text-emerald-700 bg-emerald-50', iconCls: 'bg-emerald-100 text-emerald-600' },
+    { id: 'Ausente',   icon: '?', active: 'bg-amber-500 text-white',   card: 'border-amber-200 bg-amber-50/40',     badge: 'text-amber-700 bg-amber-50',   iconCls: 'bg-amber-100 text-amber-600' },
+    { id: 'Rechazó',   icon: '✗', active: 'bg-rose-500 text-white',    card: 'border-rose-200 bg-rose-50/40',       badge: 'text-rose-700 bg-rose-50',     iconCls: 'bg-rose-100 text-rose-600' },
+    { id: 'Reagendar', icon: '↺', active: 'bg-blue-500 text-white',    card: 'border-blue-200 bg-blue-50/40',       badge: 'text-blue-700 bg-blue-50',     iconCls: 'bg-blue-100 text-blue-600' },
+];
+
+const TIPO_CLS = {
+    'En ambos padrones':   'bg-indigo-50 text-indigo-700 border-indigo-100',
+    'SIN REGISTRO PREVIO': 'bg-amber-50 text-amber-700 border-amber-100',
+    'MUNICIPAL':           'bg-violet-50 text-violet-700 border-violet-100',
+};
+
+// ── localStorage helpers ──────────────────────────────────────────────────────
+const loadLS = (key, def) => { try { return JSON.parse(localStorage.getItem(key) ?? null) ?? def; } catch { return def; } };
+const saveLS = (key, val) => { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} };
+
+// ── CSV parser (soporta campos con comas y saltos dentro de comillas) ─────────
+function parseCSV(text) {
+    const rows = [];
+    let row = [];
+    let i = 0;
+    const n = text.length;
+
+    while (i < n) {
+        if (text[i] === '"') {
+            i++;
+            let val = '';
+            while (i < n) {
+                if (text[i] === '"' && text[i + 1] === '"') { val += '"'; i += 2; }
+                else if (text[i] === '"') { i++; break; }
+                else val += text[i++];
+            }
+            row.push(val);
+        } else {
+            let val = '';
+            while (i < n && text[i] !== ',' && text[i] !== '\r' && text[i] !== '\n') val += text[i++];
+            row.push(val);
+        }
+
+        if (i >= n) break;
+        if (text[i] === ',') { i++; continue; }
+        if (text[i] === '\r' || text[i] === '\n') {
+            if (text[i] === '\r' && text[i + 1] === '\n') i++;
+            i++;
+            if (row.some(v => v !== '')) rows.push(row);
+            row = [];
+        }
+    }
+    if (row.some(v => v !== '')) rows.push(row);
+    return rows;
+}
+
+function csvToPadron(text) {
+    const rows = parseCSV(text);
+    if (rows.length < 2) return [];
+    // Columnas según Columnas.txt:
+    // 0:Orden_Ruta 1:Orden_Ruta_Seccion 2:Folio_Padron 3:LATITUD 4:LONGITUD
+    // 5:DL 6:SECCION 7:Colonia Catalogo 8:Orden Completo 9:Domicilio Completo
+    // 10:Nombre 11:Telefono Principal 12:Tutor Telefono 13:TIPO
+    return rows.slice(1).map(r => ({
+        orden_ruta:  Number(r[0]),
+        folio:       r[2],
+        lat:         Number(r[3]),
+        lng:         Number(r[4]),
+        dl:          Number(r[5]),
+        seccion:     Number(r[6]),
+        colonia:     r[7]  || '',
+        domicilio:   r[9]  || '',
+        nombre:      r[10] || '',
+        telefono:    r[11] || '',
+        tutor_tel:   r[12] || '',
+        tipo:        r[13] || '',
+    }));
+}
+
+// ── GAS sync helper ───────────────────────────────────────────────────────────
+const gasConfigured = () => GAS_URL && !GAS_URL.includes('TU_URL');
+
+function syncOne(v) {
+    if (!gasConfigured()) return Promise.resolve(false);
+    const url = `${GAS_URL}?action=save&data=${encodeURIComponent(JSON.stringify(v))}`;
+    return fetch(url)
+        .then(r => r.json())
+        .then(r => !!(r && r.ok))
+        .catch(() => false);
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App() {
+    const [loadState, setLoadState] = useState('loading'); // loading | ready | error
+    const [padron,    setPadron]    = useState([]);
+    const [visits,    setVisits]    = useState(() => loadLS('dis_visitas', {}));
+    const [pending,   setPending]   = useState(() => loadLS('dis_pending', []));
+    const [view,      setView]      = useState('sections');
+    const [selSec,    setSelSec]    = useState(null);
+    const [modal,     setModal]     = useState(null);
+    const [mEstado,   setMEstado]   = useState('Visitado');
+    const [mNotas,    setMNotas]    = useState('');
+    const [search,    setSearch]    = useState('');
+    const [fTipo,     setFTipo]     = useState('all');
+    const [fEstado,   setFEstado]   = useState('all');
+    const [fDL,         setFDL]         = useState('all');
+    const [globalFolio,    setGlobalFolio]    = useState('');
+    const [assignMode,     setAssignMode]     = useState(false);
+    const [selectedSecs,   setSelectedSecs]   = useState(new Set());
+    const [encargado,      setEncargado]      = useState('');
+    const [assignStatus,   setAssignStatus]   = useState('idle'); // idle | saving | ok | error
+    const [syncSt,         setSyncSt]         = useState('idle'); // idle | syncing | ok | error
+    const [secAsig,        setSecAsig]        = useState(() => loadLS('dis_asig_map', {})); // { [seccion]: encargado }
+    const [fEncargado,     setFEncargado]     = useState('all');
+
+    // Carga el CSV desde la misma carpeta
+    useEffect(() => {
+        fetch('RutaDis26.csv')
+            .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+            .then(text => { setPadron(csvToPadron(text)); setLoadState('ready'); })
+            .catch(() => setLoadState('error'));
+    }, []);
+
+    useEffect(() => { saveLS('dis_visitas', visits); }, [visits]);
+    useEffect(() => { saveLS('dis_pending', pending); }, [pending]);
+    useEffect(() => { saveLS('dis_asig_map', secAsig); }, [secAsig]);
+
+    // Carga asignaciones desde GAS (en background, sin bloquear la UI)
+    useEffect(() => {
+        if (loadState !== 'ready' || !gasConfigured()) return;
+        fetch(`${GAS_URL}?action=getAsignaciones`)
+            .then(r => r.json())
+            .then(result => {
+                if (!result.ok || !result.data) return;
+                const map = {};
+                result.data.forEach(({ seccion, encargado }) => { map[seccion] = encargado; });
+                setSecAsig(map);
+            })
+            .catch(() => {}); // falla silenciosamente; usa caché local
+    }, [loadState]);
+
+    // ── Datos derivados ───────────────────────────────────────────────────────
+    const sections = useMemo(() => {
+        const map = {};
+        padron.forEach(p => {
+            if (!map[p.seccion]) map[p.seccion] = { seccion: p.seccion, dl: p.dl, colonia: p.colonia, items: [] };
+            map[p.seccion].items.push(p);
+        });
+        return Object.values(map).map(s => ({
+            ...s,
+            items: [...s.items].sort((a, b) => a.orden_ruta - b.orden_ruta),
+            orden: Math.min(...s.items.map(i => i.orden_ruta)),
+        })).sort((a, b) => a.orden - b.orden);
+    }, [padron]);
+
+    const secProg = useMemo(() => {
+        const m = {};
+        sections.forEach(s => { m[s.seccion] = { total: s.items.length, done: s.items.filter(i => visits[i.folio]).length }; });
+        return m;
+    }, [sections, visits]);
+
+    const totalItems   = padron.length;
+    const totalDone    = Object.keys(visits).length;
+    const overallPct   = totalItems > 0 ? Math.round(totalDone / totalItems * 100) : 0;
+    const pendingCount = pending.length;
+
+    const filteredSections = useMemo(() => sections.filter(s => {
+        const q = search.toLowerCase();
+        if (q && !s.seccion.toString().includes(q) && !s.colonia.toLowerCase().includes(q) && !s.dl.toString().includes(q)) return false;
+        if (fDL !== 'all' && s.dl !== fDL) return false;
+        if (fEncargado !== 'all' && secAsig[s.seccion] !== fEncargado) return false;
+        const p = secProg[s.seccion] || { total: 0, done: 0 };
+        if (fEstado === 'pending')   return p.done < p.total;
+        if (fEstado === 'completed') return p.total > 0 && p.done === p.total;
+        return true;
+    }), [sections, search, fEstado, fDL, fEncargado, secAsig, secProg]);
+
+    const dls = useMemo(() => [...new Set(sections.map(s => s.dl))].sort((a, b) => a - b), [sections]);
+
+    const encargados = useMemo(() =>
+        [...new Set(Object.values(secAsig))].filter(Boolean).sort()
+    , [secAsig]);
+
+    const globalResults = useMemo(() => {
+        const q = globalFolio.trim();
+        if (!q) return [];
+        return padron.filter(p => p.folio.toLowerCase().includes('ae2619-' + q.toLowerCase()));
+    }, [padron, globalFolio]);
+
+    const currentSection = useMemo(() => sections.find(s => s.seccion === selSec), [sections, selSec]);
+    const tipos = useMemo(() => [...new Set((currentSection?.items || []).map(i => i.tipo).filter(Boolean))], [currentSection]);
+
+    const beneficiaries = useMemo(() => {
+        if (!currentSection) return [];
+        return currentSection.items.filter(p => {
+            const q = search.trim();
+            if (q && !p.folio.toLowerCase().includes('ae2619-' + q.toLowerCase())) return false;
+            if (fTipo !== 'all' && p.tipo !== fTipo) return false;
+            if (fEstado === 'pending'   &&  visits[p.folio]) return false;
+            if (fEstado === 'completed' && !visits[p.folio]) return false;
+            return true;
+        });
+    }, [currentSection, search, fTipo, fEstado, visits]);
+
+    // ── Acciones ──────────────────────────────────────────────────────────────
+    const openSection = sec => { setSelSec(sec); setSearch(''); setFTipo('all'); setFEstado('all'); setView('detail'); };
+    const goBack      = ()  => { setView('sections'); setSelSec(null); setSearch(''); setFDL('all'); };
+
+    const openModal = item => {
+        const v = visits[item.folio];
+        setModal(item);
+        setMEstado(v?.estado || 'Visitado');
+        setMNotas(v?.notas   || '');
+    };
+
+    const clearVisit = useCallback(() => {
+        if (!modal) return;
+        setVisits(prev  => { const n = { ...prev }; delete n[modal.folio]; return n; });
+        setPending(prev => prev.filter(p => p.folio !== modal.folio));
+        setModal(null);
+    }, [modal]);
+
+    const confirmVisit = useCallback(() => {
+        if (!modal) return;
+        const folio = modal.folio;
+        const v = {
+            folio,
+            orden_ruta: modal.orden_ruta,
+            nombre:     modal.nombre,
+            seccion:    modal.seccion,
+            dl:         modal.dl,
+            domicilio:  modal.domicilio,
+            colonia:    modal.colonia,
+            tipo:       modal.tipo,
+            telefono:   modal.telefono,
+            estado:     mEstado,
+            notas:      mNotas,
+            timestamp:  new Date().toISOString(),
+            synced:     false,
+        };
+
+        setVisits(prev => ({ ...prev, [folio]: v }));
+        setModal(null);
+
+        syncOne(v).then(ok => {
+            if (ok) {
+                setVisits(prev => prev[folio] ? { ...prev, [folio]: { ...prev[folio], synced: true } } : prev);
+                setPending(prev => prev.filter(p => p.folio !== folio));
+            } else {
+                setPending(prev => { const f = prev.filter(p => p.folio !== folio); return [...f, v]; });
+            }
+        });
+    }, [modal, mEstado, mNotas]);
+
+    const syncPending = useCallback(() => {
+        if (pendingCount === 0 || syncSt === 'syncing' || !gasConfigured()) return;
+        setSyncSt('syncing');
+        const snapshot = [...pending];
+
+        Promise.all(snapshot.map(v => syncOne(v).then(ok => ok ? v.folio : null)))
+            .then(results => {
+                const synced = new Set(results.filter(Boolean));
+                setPending(snapshot.filter(v => !synced.has(v.folio)));
+                setVisits(prev => {
+                    const n = { ...prev };
+                    synced.forEach(f => { if (n[f]) n[f] = { ...n[f], synced: true }; });
+                    return n;
+                });
+                setSyncSt(synced.size === snapshot.length ? 'ok' : 'error');
+                setTimeout(() => setSyncSt('idle'), 2500);
+            });
+    }, [pending, pendingCount, syncSt]);
+
+    // ── Asignaciones ──────────────────────────────────────────────────────────
+    const toggleSec = useCallback(sec => {
+        setSelectedSecs(prev => {
+            const n = new Set(prev);
+            n.has(sec) ? n.delete(sec) : n.add(sec);
+            return n;
+        });
+    }, []);
+
+    const selectedBenefCount = useMemo(() =>
+        sections.filter(s => selectedSecs.has(s.seccion)).reduce((sum, s) => sum + s.items.length, 0),
+    [sections, selectedSecs]);
+
+    const cancelAssign = useCallback(() => {
+        setAssignMode(false);
+        setSelectedSecs(new Set());
+        setEncargado('');
+        setAssignStatus('idle');
+    }, []);
+
+    const saveAsignacion = useCallback(() => {
+        if (!encargado.trim() || selectedSecs.size === 0 || !gasConfigured()) return;
+        setAssignStatus('saving');
+
+        const items = [];
+        sections.forEach(s => {
+            if (selectedSecs.has(s.seccion)) {
+                s.items.forEach(p => items.push({
+                    encargado: encargado.trim(),
+                    folio:     p.folio,
+                    nombre:    p.nombre,
+                    seccion:   p.seccion,
+                    dl:        p.dl,
+                    colonia:   p.colonia,
+                    domicilio: p.domicilio,
+                    tipo:      p.tipo,
+                    telefono:  p.telefono,
+                }));
+            }
+        });
+
+        const CHUNK = 50;
+        const chunks = [];
+        for (let i = 0; i < items.length; i += CHUNK) chunks.push(items.slice(i, i + CHUNK));
+
+        chunks.reduce((chain, chunk) =>
+            chain.then(() =>
+                fetch(`${GAS_URL}?action=asignar&items=${encodeURIComponent(JSON.stringify(chunk))}`)
+                    .then(r => r.json())
+                    .then(r => { if (!r.ok) throw new Error(); })
+            ), Promise.resolve()
+        ).then(() => {
+            setAssignStatus('ok');
+            // Actualizar mapa local de asignaciones
+            setSecAsig(prev => {
+                const updated = { ...prev };
+                selectedSecs.forEach(sec => { updated[sec] = encargado.trim(); });
+                return updated;
+            });
+            setTimeout(cancelAssign, 2000);
+        }).catch(() => {
+            setAssignStatus('error');
+            setTimeout(() => setAssignStatus('idle'), 3000);
+        });
+    }, [encargado, selectedSecs, sections, cancelAssign]);
+
+    // ── Pantalla: cargando ────────────────────────────────────────────────────
+    if (loadState === 'loading') return (
+        <div className="min-h-screen flex flex-col items-center justify-center bg-indigo-700 text-white gap-4">
+            <div className="w-12 h-12 border-4 border-white border-t-transparent rounded-full animate-spin" />
+            <div className="text-center">
+                <p className="font-bold text-lg">Cargando padrón…</p>
+                <p className="text-indigo-300 text-sm mt-1">Leyendo RutaDis26.csv</p>
+            </div>
+        </div>
+    );
+
+    // ── Pantalla: error CSV ───────────────────────────────────────────────────
+    if (loadState === 'error') return (
+        <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 p-6 gap-4">
+            <div className="text-6xl">⚠️</div>
+            <h2 className="text-xl font-bold text-slate-800">No se pudo cargar el padrón</h2>
+            <p className="text-slate-500 text-sm text-center">
+                Verifica que <code className="bg-slate-100 px-1 rounded">RutaDis26.csv</code> esté en la misma carpeta<br />
+                y que estés usando Live Server o GitHub Pages (no <code className="bg-slate-100 px-1 rounded">file://</code>).
+            </p>
+            <button onClick={() => window.location.reload()} className="bg-indigo-600 text-white px-6 py-3 rounded-xl font-bold">
+                Reintentar
+            </button>
+        </div>
+    );
+
+    // ── Pantalla: secciones ───────────────────────────────────────────────────
+    if (view === 'sections') return (
+        <div className={`min-h-screen bg-slate-50 ${assignMode ? 'pb-44' : 'pb-16'}`}>
+            <header className="sticky top-0 bg-indigo-700 text-white p-4 shadow-lg z-20">
+                <div className="flex justify-between items-center mb-2">
+                    <h1 className="text-base font-bold">🦽 Visitas Discapacidad 2026</h1>
+                    <div className="flex items-center gap-2">
+                        <button onClick={() => assignMode ? cancelAssign() : setAssignMode(true)}
+                            className={`text-xs px-2.5 py-1 rounded-full font-bold transition-colors ${assignMode ? 'bg-rose-500 text-white' : 'bg-white/20 text-white'}`}>
+                            {assignMode ? '✕ Cancelar' : '📋 Asignar'}
+                        </button>
+                        {!assignMode && pendingCount > 0 && (
+                            <button onClick={syncPending}
+                                title={!gasConfigured() ? 'Configura GAS_URL en Index.html para sincronizar' : ''}
+                                className={`text-xs px-2.5 py-1 rounded-full font-bold transition-colors ${
+                                    !gasConfigured()       ? 'bg-slate-500 text-white opacity-60' :
+                                    syncSt === 'syncing'   ? 'bg-indigo-400 text-white' :
+                                    syncSt === 'error'     ? 'bg-rose-500 text-white' :
+                                    syncSt === 'ok'        ? 'bg-emerald-500 text-white' :
+                                                             'bg-amber-400 text-amber-900'
+                                }`}>
+                                {syncSt === 'syncing' ? '⟳ Sync…' : syncSt === 'error' ? '✗ Error' : syncSt === 'ok' ? '✓ Listo' : `↑ ${pendingCount}`}
+                            </button>
+                        )}
+                        <span className="text-xs bg-indigo-900/50 px-2.5 py-1 rounded-full font-medium">
+                            {totalDone}/{totalItems} ({overallPct}%)
+                        </span>
+                    </div>
+                </div>
+                <div className="w-full bg-indigo-900/30 h-1.5 rounded-full overflow-hidden mb-3">
+                    <div className="bg-emerald-400 h-full transition-all duration-500" style={{ width: `${overallPct}%` }} />
+                </div>
+                {assignMode ? (
+                    <div className="bg-amber-400/20 border border-amber-400/40 rounded-xl px-4 py-2.5">
+                        <p className="text-amber-200 text-xs font-bold uppercase tracking-wider mb-1.5">Nombre del encargado</p>
+                        <input type="text" placeholder="Ej. Juan Pérez…"
+                            className="w-full bg-transparent text-white placeholder-amber-300/60 text-sm focus:outline-none font-medium"
+                            value={encargado} onChange={e => setEncargado(e.target.value)}
+                            autoFocus />
+                    </div>
+                ) : (
+                    <input type="text" placeholder="Buscar sección, colonia o distrito…"
+                        className="w-full bg-indigo-800 text-white placeholder-indigo-300 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 mb-2"
+                        value={search} onChange={e => setSearch(e.target.value)} />
+                )}
+                {!assignMode && (
+                    <div className="flex items-center bg-indigo-800 rounded-xl focus-within:ring-2 focus-within:ring-amber-400 overflow-hidden mt-2">
+                        <span className="pl-4 pr-1 text-indigo-300 text-sm font-mono select-none whitespace-nowrap">AE2619-</span>
+                        <input
+                            type="text"
+                            inputMode="numeric"
+                            maxLength={4}
+                            placeholder="buscar folio global"
+                            className="flex-1 bg-transparent text-white placeholder-indigo-400 py-2.5 text-sm font-mono focus:outline-none"
+                            value={globalFolio}
+                            onChange={e => setGlobalFolio(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                        />
+                        {globalFolio && (
+                            <button onClick={() => setGlobalFolio('')} className="px-3 text-indigo-300 text-xl leading-none">×</button>
+                        )}
+                    </div>
+                )}
+            </header>
+
+            <div className="flex gap-2 px-3 pt-2 pb-1 overflow-x-auto no-scrollbar">
+                {[['all','Todas'],['pending','Pendientes'],['completed','Completadas']].map(([id, label]) => (
+                    <button key={id} onClick={() => setFEstado(id)}
+                        className={`px-4 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors ${fEstado === id ? 'bg-indigo-600 text-white shadow-sm' : 'bg-white text-slate-600 border border-slate-200'}`}>
+                        {label}
+                    </button>
+                ))}
+            </div>
+            <div className="flex gap-2 px-3 pb-1 overflow-x-auto no-scrollbar">
+                <button onClick={() => setFDL('all')}
+                    className={`px-4 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors ${fDL === 'all' ? 'bg-slate-700 text-white shadow-sm' : 'bg-white text-slate-600 border border-slate-200'}`}>
+                    Todos los distritos
+                </button>
+                {dls.map(dl => (
+                    <button key={dl} onClick={() => setFDL(fDL === dl ? 'all' : dl)}
+                        className={`px-4 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors ${fDL === dl ? 'bg-slate-700 text-white shadow-sm' : 'bg-white text-slate-600 border border-slate-200'}`}>
+                        Distrito {dl}
+                    </button>
+                ))}
+            </div>
+            {encargados.length > 0 && (
+                <div className="flex gap-2 px-3 pb-2 overflow-x-auto no-scrollbar">
+                    <button onClick={() => setFEncargado('all')}
+                        className={`px-4 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors ${fEncargado === 'all' ? 'bg-amber-600 text-white shadow-sm' : 'bg-white text-slate-600 border border-slate-200'}`}>
+                        Todos los encargados
+                    </button>
+                    {encargados.map(enc => (
+                        <button key={enc} onClick={() => setFEncargado(fEncargado === enc ? 'all' : enc)}
+                            className={`px-4 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors ${fEncargado === enc ? 'bg-amber-600 text-white shadow-sm' : 'bg-white text-slate-600 border border-slate-200'}`}>
+                            👤 {enc}
+                        </button>
+                    ))}
+                </div>
+            )}
+
+            <main className="px-3 space-y-2">
+                {globalFolio ? (
+                    globalResults.length === 0 ? (
+                        <div className="text-center py-16 text-slate-400">
+                            <div className="text-4xl mb-2 opacity-30">🔍</div>
+                            <p>Sin resultados para AE2619-{globalFolio}</p>
+                        </div>
+                    ) : globalResults.map(item => {
+                        const v   = visits[item.folio];
+                        const est = v ? ESTADOS.find(e => e.id === v.estado) : null;
+                        return (
+                            <div key={item.folio} onClick={() => openModal(item)}
+                                className={`bg-white rounded-2xl border-2 p-3.5 shadow-sm tap cursor-pointer ${est ? est.card : 'border-slate-100'}`}>
+                                <div className="flex items-start gap-3">
+                                    <span className={`shrink-0 mt-0.5 w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold ${est ? est.iconCls : 'bg-slate-100 text-slate-400'}`}>
+                                        {est ? est.icon : '○'}
+                                    </span>
+                                    <div className="grow min-w-0">
+                                        <div className="flex items-start justify-between gap-2">
+                                            <div className="min-w-0">
+                                                <p className={`font-bold text-sm truncate ${v ? 'text-slate-500' : 'text-slate-800'}`}>
+                                                    <span className="text-slate-400 font-normal">{item.orden_ruta} |</span> {item.nombre}
+                                                </p>
+                                                <p className="text-slate-400 text-xs">{item.folio} • Sección {item.seccion} • DL {item.dl}</p>
+                                            </div>
+                                            {est && <span className={`text-xs font-bold px-2 py-0.5 rounded-full shrink-0 ${est.badge}`}>{est.id}</span>}
+                                        </div>
+                                        <p className="text-slate-500 text-xs mt-1 leading-snug">{item.domicilio}</p>
+                                        <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                                            {item.tipo && (
+                                                <span className={`text-xs px-2 py-0.5 rounded border font-medium ${TIPO_CLS[item.tipo] || 'bg-slate-50 text-slate-600 border-slate-100'}`}>
+                                                    {item.tipo}
+                                                </span>
+                                            )}
+                                            {item.telefono && (
+                                                <a href={`tel:${item.telefono}`} onClick={e => e.stopPropagation()}
+                                                    className="text-xs text-indigo-600 font-medium">📞 {item.telefono}</a>
+                                            )}
+                                            {item.tutor_tel && item.tutor_tel !== '0' && item.tutor_tel !== '' && (
+                                                <a href={`tel:${item.tutor_tel}`} onClick={e => e.stopPropagation()}
+                                                    className="text-xs text-violet-600 font-medium">👥 {item.tutor_tel}</a>
+                                            )}
+                                        </div>
+                                    </div>
+                                    <a href={`https://www.google.com/maps/search/?api=1&query=${item.lat},${item.lng}`}
+                                        target="_blank" rel="noopener noreferrer"
+                                        onClick={e => e.stopPropagation()}
+                                        className="shrink-0 p-2.5 bg-indigo-50 text-indigo-600 rounded-xl text-lg leading-none">
+                                        📍
+                                    </a>
+                                </div>
+                            </div>
+                        );
+                    })
+                ) : filteredSections.length === 0 ? (
+                    <div className="text-center py-16 text-slate-400">
+                        <div className="text-4xl mb-2 opacity-30">🔍</div>
+                        <p>Sin resultados</p>
+                    </div>
+                ) : filteredSections.map(sec => {
+                    const p    = secProg[sec.seccion] || { total: 0, done: 0 };
+                    const pct  = p.total > 0 ? Math.round(p.done / p.total * 100) : 0;
+                    const done = p.total > 0 && p.done === p.total;
+                    const isSel = selectedSecs.has(sec.seccion);
+                    return (
+                        <div key={sec.seccion}
+                            onClick={() => assignMode ? toggleSec(sec.seccion) : openSection(sec.seccion)}
+                            className={`bg-white rounded-2xl border-2 p-4 shadow-sm tap cursor-pointer transition-all ${
+                                assignMode && isSel ? 'border-amber-400 bg-amber-50/40' :
+                                done ? 'border-emerald-200 bg-emerald-50/30' : 'border-slate-100'
+                            }`}>
+                            <div className="flex justify-between items-start mb-2">
+                                <div className="flex items-start gap-2 min-w-0">
+                                    {assignMode && (
+                                        <span className={`shrink-0 mt-0.5 w-5 h-5 rounded border-2 flex items-center justify-center text-xs font-bold ${isSel ? 'bg-amber-400 border-amber-400 text-white' : 'border-slate-300'}`}>
+                                            {isSel ? '✓' : ''}
+                                        </span>
+                                    )}
+                                    <div>
+                                        <div className="flex items-center gap-1.5">
+                                            {!assignMode && done && <span className="text-emerald-500 font-bold">✓</span>}
+                                            <h2 className={`font-bold ${done && !assignMode ? 'text-slate-500' : 'text-slate-800'}`}>Sección {sec.seccion}</h2>
+                                        </div>
+                                        <p className="text-slate-400 text-xs mt-0.5">DL {sec.dl} • {sec.colonia} • {p.total} personas</p>
+                                    </div>
+                                </div>
+                                <div className="text-right shrink-0">
+                                    <p className={`text-sm font-bold ${done && !assignMode ? 'text-emerald-600' : 'text-indigo-600'}`}>{p.done}/{p.total}</p>
+                                    <p className="text-xs text-slate-400">{pct}%</p>
+                                </div>
+                            </div>
+                            <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                                <div className={`h-full rounded-full transition-all ${isSel && assignMode ? 'bg-amber-400' : done ? 'bg-emerald-400' : 'bg-indigo-500'}`} style={{ width: `${pct}%` }} />
+                            </div>
+                        </div>
+                    );
+                })}
+            </main>
+
+            {/* Panel de asignación */}
+            {assignMode && (
+                <div className="fixed bottom-0 left-0 right-0 bg-white border-t-2 border-amber-300 shadow-xl z-30 p-4 space-y-3">
+                    <div className="flex items-center justify-between text-sm">
+                        <span className="font-bold text-slate-700">
+                            {selectedSecs.size === 0
+                                ? 'Selecciona secciones arriba'
+                                : `${selectedSecs.size} sección${selectedSecs.size > 1 ? 'es' : ''} • ${selectedBenefCount} beneficiarios`}
+                        </span>
+                        {selectedSecs.size > 0 && (
+                            <button onClick={() => setSelectedSecs(new Set())}
+                                className="text-xs text-slate-400 underline">Limpiar</button>
+                        )}
+                    </div>
+                    <div className="flex gap-2">
+                        <button onClick={cancelAssign}
+                            className="flex-none px-4 py-3 rounded-xl border-2 border-slate-200 text-slate-500 font-bold text-sm">
+                            Cancelar
+                        </button>
+                        <button
+                            onClick={saveAsignacion}
+                            disabled={selectedSecs.size === 0 || !encargado.trim() || assignStatus === 'saving'}
+                            className={`flex-1 py-3 rounded-xl font-bold text-sm transition-all ${
+                                assignStatus === 'saving' ? 'bg-amber-400 text-white opacity-70' :
+                                assignStatus === 'ok'     ? 'bg-emerald-500 text-white' :
+                                assignStatus === 'error'  ? 'bg-rose-500 text-white' :
+                                selectedSecs.size === 0 || !encargado.trim()
+                                    ? 'bg-slate-200 text-slate-400' : 'bg-amber-500 text-white'
+                            }`}>
+                            {assignStatus === 'saving' ? '⟳ Guardando…' :
+                             assignStatus === 'ok'     ? '✓ Asignación guardada' :
+                             assignStatus === 'error'  ? '✗ Error — reintentar' :
+                             `📋 Generar asignación`}
+                        </button>
+                    </div>
+                </div>
+            )}
+
+            <footer className="fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-sm border-t border-slate-200 p-2 text-center text-[10px] text-slate-400 font-bold uppercase tracking-widest" style={{ display: assignMode ? 'none' : '' }}>
+                {globalFolio
+                    ? `${globalResults.length} resultado${globalResults.length !== 1 ? 's' : ''} para AE2619-${globalFolio}`
+                    : `${filteredSections.length} secciones • ${totalItems.toLocaleString()} beneficiarios`}
+            </footer>
+
+            {/* Modal — accesible también desde búsqueda global de folio */}
+            {modal && (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-end" onClick={() => setModal(null)}>
+                    <div className="bg-white w-full rounded-t-3xl p-5 max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+                        <div className="w-10 h-1 bg-slate-200 rounded-full mx-auto mb-5" />
+                        <div className="mb-5 bg-slate-50 rounded-2xl p-4">
+                            <p className="font-bold text-slate-800 text-base">{modal.nombre}</p>
+                            <p className="text-xs text-slate-400 mb-2">{modal.folio} • Ruta #{modal.orden_ruta} • Sección {modal.seccion}</p>
+                            <p className="text-slate-600 text-sm leading-snug">{modal.domicilio}</p>
+                            <div className="flex flex-wrap gap-3 mt-2">
+                                {modal.telefono && (
+                                    <a href={`tel:${modal.telefono}`} className="text-indigo-600 text-sm font-medium">📞 {modal.telefono}</a>
+                                )}
+                                {modal.tutor_tel && modal.tutor_tel !== '' && modal.tutor_tel !== '0' && (
+                                    <a href={`tel:${modal.tutor_tel}`} className="text-violet-600 text-sm font-medium">👥 {modal.tutor_tel}</a>
+                                )}
+                            </div>
+                            <a href={`https://www.google.com/maps/search/?api=1&query=${modal.lat},${modal.lng}`}
+                                target="_blank" rel="noopener noreferrer"
+                                className="mt-3 flex items-center gap-2 bg-indigo-50 text-indigo-700 text-sm font-medium px-3 py-2 rounded-xl w-full justify-center">
+                                📍 Abrir en Google Maps
+                            </a>
+                            {modal.tipo && (
+                                <span className={`text-xs px-2 py-0.5 rounded border font-medium inline-block mt-3 ${TIPO_CLS[modal.tipo] || 'bg-slate-50 text-slate-600 border-slate-100'}`}>
+                                    {modal.tipo}
+                                </span>
+                            )}
+                        </div>
+                        <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Resultado de la visita</p>
+                        <div className="grid grid-cols-2 gap-2 mb-4">
+                            {ESTADOS.map(est => (
+                                <button key={est.id} onClick={() => setMEstado(est.id)}
+                                    className={`py-3 rounded-xl font-bold text-sm transition-all ${mEstado === est.id ? est.active : 'bg-slate-100 text-slate-600'}`}>
+                                    {est.icon} {est.id}
+                                </button>
+                            ))}
+                        </div>
+                        <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Notas (opcional)</p>
+                        <textarea
+                            className="w-full border border-slate-200 rounded-xl p-3 text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-400 resize-none mb-4"
+                            rows={3} placeholder="Observaciones de la visita…"
+                            value={mNotas} onChange={e => setMNotas(e.target.value)} />
+                        <div className="flex gap-2">
+                            {visits[modal.folio] && (
+                                <button onClick={clearVisit} className="flex-1 border-2 border-slate-200 text-slate-500 py-3.5 rounded-xl font-bold text-sm">Quitar</button>
+                            )}
+                            <button onClick={confirmVisit} className="flex-1 bg-indigo-600 text-white py-3.5 rounded-xl font-bold text-base active:bg-indigo-700">Confirmar</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+
+    // ── Pantalla: detalle sección ─────────────────────────────────────────────
+    const sp    = secProg[selSec] || { total: 0, done: 0 };
+    const spPct = sp.total > 0 ? Math.round(sp.done / sp.total * 100) : 0;
+
+    return (
+        <div className="min-h-screen bg-slate-50 pb-16">
+            <header className="sticky top-0 bg-indigo-700 text-white p-4 shadow-lg z-20">
+                <div className="flex items-center gap-3 mb-2">
+                    <button onClick={goBack} className="p-2 bg-indigo-600 rounded-xl font-bold text-sm shrink-0">←</button>
+                    <div className="grow min-w-0">
+                        <h1 className="font-bold">Sección {selSec}</h1>
+                        <p className="text-indigo-300 text-xs truncate">{currentSection?.colonia} • DL {currentSection?.dl}</p>
+                    </div>
+                    <span className="text-xs bg-indigo-900/50 px-2.5 py-1 rounded-full font-medium shrink-0">
+                        {sp.done}/{sp.total} ({spPct}%)
+                    </span>
+                </div>
+                <div className="w-full bg-indigo-900/30 h-1.5 rounded-full overflow-hidden mb-3">
+                    <div className="bg-emerald-400 h-full transition-all" style={{ width: `${spPct}%` }} />
+                </div>
+                <div className="flex items-center bg-indigo-800 rounded-xl focus-within:ring-2 focus-within:ring-indigo-400 overflow-hidden">
+                    <span className="pl-4 pr-1 text-indigo-300 text-sm font-mono select-none whitespace-nowrap">AE2619-</span>
+                    <input
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={4}
+                        placeholder="0000"
+                        className="flex-1 bg-transparent text-white placeholder-indigo-400 pr-4 py-2.5 text-sm font-mono focus:outline-none"
+                        value={search}
+                        onChange={e => setSearch(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                    />
+                </div>
+            </header>
+
+            <div className="flex gap-2 px-3 py-2 overflow-x-auto no-scrollbar">
+                {[['all','Todos'],['pending','Pendientes'],['completed','Visitados']].map(([id, label]) => (
+                    <button key={id} onClick={() => setFEstado(id)}
+                        className={`px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap ${fEstado === id ? 'bg-indigo-600 text-white' : 'bg-white text-slate-600 border border-slate-200'}`}>
+                        {label}
+                    </button>
+                ))}
+                {tipos.map(t => (
+                    <button key={t} onClick={() => setFTipo(fTipo === t ? 'all' : t)}
+                        className={`px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap ${fTipo === t ? 'bg-violet-600 text-white' : 'bg-white text-slate-600 border border-slate-200'}`}>
+                        {t}
+                    </button>
+                ))}
+            </div>
+
+            <main className="px-3 space-y-2">
+                {beneficiaries.length === 0 ? (
+                    <div className="text-center py-16 text-slate-400">
+                        <div className="text-4xl mb-2 opacity-30">🔍</div>
+                        <p>Sin resultados</p>
+                    </div>
+                ) : beneficiaries.map(item => {
+                    const v   = visits[item.folio];
+                    const est = v ? ESTADOS.find(e => e.id === v.estado) : null;
+                    return (
+                        <div key={item.folio} onClick={() => openModal(item)}
+                            className={`bg-white rounded-2xl border-2 p-3.5 shadow-sm tap cursor-pointer ${est ? est.card : 'border-slate-100'}`}>
+                            <div className="flex items-start gap-3">
+                                <span className={`shrink-0 mt-0.5 w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold ${est ? est.iconCls : 'bg-slate-100 text-slate-400'}`}>
+                                    {est ? est.icon : '○'}
+                                </span>
+                                <div className="grow min-w-0">
+                                    <div className="flex items-start justify-between gap-2">
+                                        <div className="min-w-0">
+                                            <p className={`font-bold text-sm truncate ${v ? 'text-slate-500' : 'text-slate-800'}`}>
+                                                <span className="text-slate-400 font-normal">{item.orden_ruta} |</span> {item.nombre}
+                                            </p>
+                                            <p className="text-slate-400 text-xs">{item.folio}</p>
+                                        </div>
+                                        {est && <span className={`text-xs font-bold px-2 py-0.5 rounded-full shrink-0 ${est.badge}`}>{est.id}</span>}
+                                    </div>
+                                    <p className="text-slate-500 text-xs mt-1 leading-snug">{item.domicilio}</p>
+                                    <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                                        {item.tipo && (
+                                            <span className={`text-xs px-2 py-0.5 rounded border font-medium ${TIPO_CLS[item.tipo] || 'bg-slate-50 text-slate-600 border-slate-100'}`}>
+                                                {item.tipo}
+                                            </span>
+                                        )}
+                                        {item.telefono && (
+                                            <a href={`tel:${item.telefono}`} onClick={e => e.stopPropagation()}
+                                                className="text-xs text-indigo-600 font-medium">
+                                                📞 {item.telefono}
+                                            </a>
+                                        )}
+                                        {item.tutor_tel && item.tutor_tel !== '0' && item.tutor_tel !== '' && (
+                                            <a href={`tel:${item.tutor_tel}`} onClick={e => e.stopPropagation()}
+                                                className="text-xs text-violet-600 font-medium">
+                                                👥 {item.tutor_tel}
+                                            </a>
+                                        )}
+                                    </div>
+                                </div>
+                                <a href={`https://www.google.com/maps/search/?api=1&query=${item.lat},${item.lng}`}
+                                    target="_blank" rel="noopener noreferrer"
+                                    onClick={e => e.stopPropagation()}
+                                    className="shrink-0 p-2.5 bg-indigo-50 text-indigo-600 rounded-xl text-lg leading-none">
+                                    📍
+                                </a>
+                            </div>
+                        </div>
+                    );
+                })}
+            </main>
+
+            <footer className="fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-sm border-t border-slate-200 p-2 text-center text-[10px] text-slate-400 font-bold uppercase tracking-widest">
+                {beneficiaries.length} de {sp.total} beneficiarios
+            </footer>
+
+            {/* ── Modal visita ─────────────────────────────────────────────── */}
+            {modal && (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-end" onClick={() => setModal(null)}>
+                    <div className="bg-white w-full rounded-t-3xl p-5 max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+                        <div className="w-10 h-1 bg-slate-200 rounded-full mx-auto mb-5" />
+
+                        {/* Info beneficiario */}
+                        <div className="mb-5 bg-slate-50 rounded-2xl p-4">
+                            <p className="font-bold text-slate-800 text-base">{modal.nombre}</p>
+                            <p className="text-xs text-slate-400 mb-2">{modal.folio} • Ruta #{modal.orden_ruta}</p>
+                            <p className="text-slate-600 text-sm leading-snug">{modal.domicilio}</p>
+                            <div className="flex flex-wrap gap-3 mt-2">
+                                {modal.telefono && (
+                                    <a href={`tel:${modal.telefono}`}
+                                        className="text-indigo-600 text-sm font-medium">📞 {modal.telefono}</a>
+                                )}
+                                {modal.tutor_tel && modal.tutor_tel !== '' && modal.tutor_tel !== '0' && (
+                                    <a href={`tel:${modal.tutor_tel}`}
+                                        className="text-violet-600 text-sm font-medium">👥 {modal.tutor_tel}</a>
+                                )}
+                            </div>
+                            <a href={`https://www.google.com/maps/search/?api=1&query=${modal.lat},${modal.lng}`}
+                                target="_blank" rel="noopener noreferrer"
+                                className="mt-3 flex items-center gap-2 bg-indigo-50 text-indigo-700 text-sm font-medium px-3 py-2 rounded-xl w-full justify-center">
+                                📍 Abrir en Google Maps
+                            </a>
+                            {modal.tipo && (
+                                <span className={`text-xs px-2 py-0.5 rounded border font-medium inline-block mt-3 ${TIPO_CLS[modal.tipo] || 'bg-slate-50 text-slate-600 border-slate-100'}`}>
+                                    {modal.tipo}
+                                </span>
+                            )}
+                        </div>
+
+                        {/* Resultado */}
+                        <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Resultado de la visita</p>
+                        <div className="grid grid-cols-2 gap-2 mb-4">
+                            {ESTADOS.map(est => (
+                                <button key={est.id} onClick={() => setMEstado(est.id)}
+                                    className={`py-3 rounded-xl font-bold text-sm transition-all ${mEstado === est.id ? est.active : 'bg-slate-100 text-slate-600'}`}>
+                                    {est.icon} {est.id}
+                                </button>
+                            ))}
+                        </div>
+
+                        {/* Notas */}
+                        <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Notas (opcional)</p>
+                        <textarea
+                            className="w-full border border-slate-200 rounded-xl p-3 text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-400 resize-none mb-4"
+                            rows={3} placeholder="Observaciones de la visita…"
+                            value={mNotas} onChange={e => setMNotas(e.target.value)} />
+
+                        <div className="flex gap-2">
+                            {visits[modal.folio] && (
+                                <button onClick={clearVisit}
+                                    className="flex-1 border-2 border-slate-200 text-slate-500 py-3.5 rounded-xl font-bold text-sm">
+                                    Quitar
+                                </button>
+                            )}
+                            <button onClick={confirmVisit}
+                                className="flex-1 bg-indigo-600 text-white py-3.5 rounded-xl font-bold text-base active:bg-indigo-700">
+                                Confirmar
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
